@@ -6,7 +6,7 @@ telemetry = true
 cache_dir = '.\.cache'
 requirements = []
 [contracts.Transparent-Talent-Contest]
-path = 'contracts/Transparent-Talent-Contest.clar'
+path = 'contracts/Transparent-Talent-Contest-Fixed.clar'
 clarity_version = 3
 epoch = 3.1
 [repl.analysis]

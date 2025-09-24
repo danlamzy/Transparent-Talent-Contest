@@ -15,6 +15,11 @@
 (define-constant ERR_INVALID_PERCENTAGE (err u110))
 (define-constant ERR_NO_ENTRIES (err u111))
 (define-constant ERR_ALREADY_FINALIZED (err u112))
+(define-constant ERR_INVALID_JUDGE (err u113))
+(define-constant ERR_INVALID_SCORE (err u114))
+(define-constant ERR_CRITERIA_NOT_FOUND (err u115))
+(define-constant ERR_ALREADY_SCORED (err u116))
+(define-constant ERR_INVALID_WEIGHT (err u117))
 
 (define-data-var contest-id-nonce uint u0)
 (define-data-var entry-id-nonce uint u0)
@@ -64,6 +69,44 @@
 (define-map user-entries
   { contest-id: uint, participant: principal }
   { entry-id: uint }
+)
+
+(define-map contest-criteria
+  { contest-id: uint, criteria-id: uint }
+  {
+    name: (string-ascii 30),
+    description: (string-ascii 100),
+    weight: uint,
+    max-score: uint
+  }
+)
+
+(define-map authorized-judges
+  { contest-id: uint, judge: principal }
+  {
+    is-certified: bool,
+    judge-weight: uint,
+    authorized-at: uint
+  }
+)
+
+(define-map detailed-scores
+  { contest-id: uint, entry-id: uint, judge: principal, criteria-id: uint }
+  {
+    score: uint,
+    feedback: (string-ascii 200),
+    scored-at: uint
+  }
+)
+
+(define-map entry-weighted-scores
+  { contest-id: uint, entry-id: uint }
+  {
+    total-weighted-score: uint,
+    judge-count: uint,
+    public-vote-count: uint,
+    last-updated: uint
+  }
 )
 
 (define-public (create-contest 
@@ -220,6 +263,119 @@
     (asserts! (> stacks-block-height (+ (get end-block contest) u1440)) ERR_CONTEST_NOT_ENDED)
     (asserts! (not (get is-finalized contest)) ERR_ALREADY_CLAIMED)
     (as-contract (stx-transfer? (get prize-pool contest) tx-sender (get creator contest)))))
+
+(define-public (set-judging-criteria
+  (contest-id uint)
+  (criteria-id uint)
+  (name (string-ascii 30))
+  (description (string-ascii 100))
+  (weight uint)
+  (max-score uint))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) ERR_CONTEST_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator contest)) ERR_UNAUTHORIZED)
+    (asserts! (< stacks-block-height (get start-block contest)) ERR_CONTEST_NOT_ACTIVE)
+    (asserts! (and (> weight u0) (<= weight u100)) ERR_INVALID_WEIGHT)
+    (asserts! (and (> max-score u0) (<= max-score u100)) ERR_INVALID_SCORE)
+    
+    (map-set contest-criteria
+      { contest-id: contest-id, criteria-id: criteria-id }
+      {
+        name: name,
+        description: description,
+        weight: weight,
+        max-score: max-score
+      })
+    (ok true)))
+
+(define-public (authorize-judge
+  (contest-id uint)
+  (judge principal)
+  (judge-weight uint))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) ERR_CONTEST_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get creator contest)) ERR_UNAUTHORIZED)
+    (asserts! (< stacks-block-height (get end-block contest)) ERR_CONTEST_ENDED)
+    (asserts! (and (> judge-weight u0) (<= judge-weight u500)) ERR_INVALID_WEIGHT)
+    
+    (map-set authorized-judges
+      { contest-id: contest-id, judge: judge }
+      {
+        is-certified: true,
+        judge-weight: judge-weight,
+        authorized-at: stacks-block-height
+      })
+    (ok true)))
+
+(define-public (score-entry-criteria
+  (contest-id uint)
+  (entry-id uint)
+  (criteria-id uint)
+  (score uint)
+  (feedback (string-ascii 200)))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) ERR_CONTEST_NOT_FOUND))
+        (entry (unwrap! (map-get? entries { entry-id: entry-id }) ERR_ENTRY_NOT_FOUND))
+        (criteria (unwrap! (map-get? contest-criteria { contest-id: contest-id, criteria-id: criteria-id }) ERR_CRITERIA_NOT_FOUND))
+        (judge-auth (map-get? authorized-judges { contest-id: contest-id, judge: tx-sender }))
+        (existing-score (map-get? detailed-scores { contest-id: contest-id, entry-id: entry-id, judge: tx-sender, criteria-id: criteria-id })))
+    (asserts! (>= stacks-block-height (get start-block contest)) ERR_CONTEST_NOT_ACTIVE)
+    (asserts! (< stacks-block-height (get end-block contest)) ERR_CONTEST_ENDED)
+    (asserts! (is-eq (get contest-id entry) contest-id) ERR_ENTRY_NOT_FOUND)
+    (asserts! (is-none existing-score) ERR_ALREADY_SCORED)
+    (asserts! (and (> score u0) (<= score (get max-score criteria))) ERR_INVALID_SCORE)
+    
+    (map-set detailed-scores
+      { contest-id: contest-id, entry-id: entry-id, judge: tx-sender, criteria-id: criteria-id }
+      {
+        score: score,
+        feedback: feedback,
+        scored-at: stacks-block-height
+      })
+    
+    (let ((weighted-score (calculate-entry-weighted-score contest-id entry-id)))
+      (map-set entry-weighted-scores
+        { contest-id: contest-id, entry-id: entry-id }
+        {
+          total-weighted-score: (get total-score weighted-score),
+          judge-count: (get judge-count weighted-score),
+          public-vote-count: (get public-count weighted-score),
+          last-updated: stacks-block-height
+        }))
+    (ok true)))
+
+(define-private (update-entry-weighted-score (contest-id uint) (entry-id uint))
+  (let ((weighted-score (calculate-entry-weighted-score contest-id entry-id)))
+    (map-set entry-weighted-scores
+      { contest-id: contest-id, entry-id: entry-id }
+      {
+        total-weighted-score: (get total-score weighted-score),
+        judge-count: (get judge-count weighted-score),
+        public-vote-count: (get public-count weighted-score),
+        last-updated: stacks-block-height
+      })
+    true))
+
+(define-private (calculate-entry-weighted-score (contest-id uint) (entry-id uint))
+  (let ((criteria-1 (map-get? contest-criteria { contest-id: contest-id, criteria-id: u1 }))
+        (criteria-2 (map-get? contest-criteria { contest-id: contest-id, criteria-id: u2 }))
+        (criteria-3 (map-get? contest-criteria { contest-id: contest-id, criteria-id: u3 })))
+    {
+      total-score: (+ 
+        (get-criteria-weighted-score contest-id entry-id u1)
+        (get-criteria-weighted-score contest-id entry-id u2)
+        (get-criteria-weighted-score contest-id entry-id u3)),
+      judge-count: u0,
+      public-count: u0
+    }
+  ))
+
+(define-private (get-criteria-weighted-score (contest-id uint) (entry-id uint) (criteria-id uint))
+  (match (map-get? contest-criteria { contest-id: contest-id, criteria-id: criteria-id })
+    criteria
+    (let ((score-1 (map-get? detailed-scores { contest-id: contest-id, entry-id: entry-id, judge: CONTRACT_OWNER, criteria-id: criteria-id })))
+      (match score-1
+        score-data (* (get score score-data) (get weight criteria))
+        u0))
+    u0
+  ))
 
 (define-read-only (get-contest (contest-id uint))
   (map-get? contests { contest-id: contest-id }))
@@ -402,4 +558,50 @@
                      (is-eq (get runner-up-entry-id contest) (some (get entry-id (unwrap-panic user-entry))))
                      false),
       already-claimed: (is-some existing-claim)
+    })))
+
+(define-read-only (get-contest-criteria (contest-id uint) (criteria-id uint))
+  (map-get? contest-criteria { contest-id: contest-id, criteria-id: criteria-id }))
+
+(define-read-only (get-judge-authorization (contest-id uint) (judge principal))
+  (map-get? authorized-judges { contest-id: contest-id, judge: judge }))
+
+(define-read-only (get-detailed-score (contest-id uint) (entry-id uint) (judge principal) (criteria-id uint))
+  (map-get? detailed-scores { contest-id: contest-id, entry-id: entry-id, judge: judge, criteria-id: criteria-id }))
+
+(define-read-only (get-entry-weighted-scores (contest-id uint) (entry-id uint))
+  (map-get? entry-weighted-scores { contest-id: contest-id, entry-id: entry-id }))
+
+(define-read-only (get-entry-score-breakdown (contest-id uint) (entry-id uint))
+  (let ((criteria-1-score (get-criteria-weighted-score contest-id entry-id u1))
+        (criteria-2-score (get-criteria-weighted-score contest-id entry-id u2))
+        (criteria-3-score (get-criteria-weighted-score contest-id entry-id u3)))
+    (ok {
+      criteria-1-weighted: criteria-1-score,
+      criteria-2-weighted: criteria-2-score,
+      criteria-3-weighted: criteria-3-score,
+      total-weighted-score: (+ criteria-1-score criteria-2-score criteria-3-score)
+    })))
+
+(define-read-only (is-authorized-judge (contest-id uint) (judge principal))
+  (match (map-get? authorized-judges { contest-id: contest-id, judge: judge })
+    auth-data (get is-certified auth-data)
+    false))
+
+(define-read-only (get-judge-feedback (contest-id uint) (entry-id uint) (judge principal) (criteria-id uint))
+  (match (map-get? detailed-scores { contest-id: contest-id, entry-id: entry-id, judge: judge, criteria-id: criteria-id })
+    score-data (some (get feedback score-data))
+    none))
+
+(define-read-only (get-contest-judging-summary (contest-id uint))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) (err u404)))
+        (criteria-1 (map-get? contest-criteria { contest-id: contest-id, criteria-id: u1 }))
+        (criteria-2 (map-get? contest-criteria { contest-id: contest-id, criteria-id: u2 }))
+        (criteria-3 (map-get? contest-criteria { contest-id: contest-id, criteria-id: u3 })))
+    (ok {
+      has-criteria: (or (is-some criteria-1) (is-some criteria-2) (is-some criteria-3)),
+      criteria-1-name: (if (is-some criteria-1) (some (get name (unwrap-panic criteria-1))) none),
+      criteria-2-name: (if (is-some criteria-2) (some (get name (unwrap-panic criteria-2))) none),
+      criteria-3-name: (if (is-some criteria-3) (some (get name (unwrap-panic criteria-3))) none),
+      total-entries: (get total-entries contest)
     })))

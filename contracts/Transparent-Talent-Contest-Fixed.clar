@@ -20,9 +20,14 @@
 (define-constant ERR_CRITERIA_NOT_FOUND (err u115))
 (define-constant ERR_ALREADY_SCORED (err u116))
 (define-constant ERR_INVALID_WEIGHT (err u117))
+(define-constant ERR_SPONSORSHIP_NOT_FOUND (err u118))
+(define-constant ERR_SPONSORSHIP_ALREADY_CLAIMED (err u119))
+(define-constant ERR_INVALID_PLACEMENT (err u120))
+(define-constant ERR_NO_ELIGIBLE_WINNER (err u121))
 
 (define-data-var contest-id-nonce uint u0)
 (define-data-var entry-id-nonce uint u0)
+(define-data-var sponsorship-id-nonce uint u0)
 
 (define-map contests
   { contest-id: uint }
@@ -106,6 +111,38 @@
     judge-count: uint,
     public-vote-count: uint,
     last-updated: uint
+  }
+)
+
+(define-map sponsorships
+  { sponsorship-id: uint }
+  {
+    contest-id: uint,
+    sponsor: principal,
+    amount: uint,
+    placement-requirement: uint,
+    description: (string-ascii 200),
+    is-active: bool,
+    is-claimed: bool,
+    created-at: uint
+  }
+)
+
+(define-map sponsorship-claims
+  { sponsorship-id: uint }
+  {
+    claimed-by: principal,
+    claimed-at: uint,
+    entry-id: uint
+  }
+)
+
+(define-map contest-sponsorships
+  { contest-id: uint }
+  {
+    sponsorship-ids: (list 20 uint),
+    total-sponsored-amount: uint,
+    active-sponsorships: uint
   }
 )
 
@@ -604,4 +641,158 @@
       criteria-2-name: (if (is-some criteria-2) (some (get name (unwrap-panic criteria-2))) none),
       criteria-3-name: (if (is-some criteria-3) (some (get name (unwrap-panic criteria-3))) none),
       total-entries: (get total-entries contest)
+    })))
+
+(define-public (create-sponsorship
+  (contest-id uint)
+  (amount uint)
+  (placement-requirement uint)
+  (description (string-ascii 200)))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) ERR_CONTEST_NOT_FOUND))
+        (sponsorship-id (+ (var-get sponsorship-id-nonce) u1)))
+    (asserts! (< stacks-block-height (get end-block contest)) ERR_CONTEST_ENDED)
+    (asserts! (> amount u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> placement-requirement u0) ERR_INVALID_PLACEMENT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set sponsorships
+      { sponsorship-id: sponsorship-id }
+      {
+        contest-id: contest-id,
+        sponsor: tx-sender,
+        amount: amount,
+        placement-requirement: placement-requirement,
+        description: description,
+        is-active: true,
+        is-claimed: false,
+        created-at: stacks-block-height
+      })
+    (let ((contest-sponsorships-data (default-to
+                                       { sponsorship-ids: (list), total-sponsored-amount: u0, active-sponsorships: u0 }
+                                       (map-get? contest-sponsorships { contest-id: contest-id })))
+          (updated-ids (unwrap! (as-max-len? (append (get sponsorship-ids contest-sponsorships-data) sponsorship-id) u20) ERR_INVALID_PLACEMENT)))
+      (map-set contest-sponsorships
+        { contest-id: contest-id }
+        {
+          sponsorship-ids: updated-ids,
+          total-sponsored-amount: (+ (get total-sponsored-amount contest-sponsorships-data) amount),
+          active-sponsorships: (+ (get active-sponsorships contest-sponsorships-data) u1)
+        }))
+    (var-set sponsorship-id-nonce sponsorship-id)
+    (ok sponsorship-id)))
+
+(define-public (claim-sponsorship-prize (sponsorship-id uint) (entry-id uint))
+  (let ((sponsorship (unwrap! (map-get? sponsorships { sponsorship-id: sponsorship-id }) ERR_SPONSORSHIP_NOT_FOUND))
+        (contest (unwrap! (map-get? contests { contest-id: (get contest-id sponsorship) }) ERR_CONTEST_NOT_FOUND))
+        (entry (unwrap! (map-get? entries { entry-id: entry-id }) ERR_ENTRY_NOT_FOUND)))
+    (asserts! (get is-finalized contest) ERR_CONTEST_NOT_ENDED)
+    (asserts! (get is-active sponsorship) ERR_SPONSORSHIP_NOT_FOUND)
+    (asserts! (not (get is-claimed sponsorship)) ERR_SPONSORSHIP_ALREADY_CLAIMED)
+    (asserts! (is-eq (get participant entry) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get contest-id entry) (get contest-id sponsorship)) ERR_ENTRY_NOT_FOUND)
+    (asserts! (is-eligible-for-sponsorship (get contest-id sponsorship) entry-id (get placement-requirement sponsorship)) ERR_NO_ELIGIBLE_WINNER)
+    (map-set sponsorships
+      { sponsorship-id: sponsorship-id }
+      (merge sponsorship { is-claimed: true }))
+    (map-set sponsorship-claims
+      { sponsorship-id: sponsorship-id }
+      {
+        claimed-by: tx-sender,
+        claimed-at: stacks-block-height,
+        entry-id: entry-id
+      })
+    (as-contract (stx-transfer? (get amount sponsorship) tx-sender (get participant entry)))))
+
+(define-public (cancel-sponsorship (sponsorship-id uint))
+  (let ((sponsorship (unwrap! (map-get? sponsorships { sponsorship-id: sponsorship-id }) ERR_SPONSORSHIP_NOT_FOUND))
+        (contest (unwrap! (map-get? contests { contest-id: (get contest-id sponsorship) }) ERR_CONTEST_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get sponsor sponsorship)) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-claimed sponsorship)) ERR_SPONSORSHIP_ALREADY_CLAIMED)
+    (asserts! (or (< stacks-block-height (get start-block contest))
+                  (> stacks-block-height (+ (get end-block contest) u1440))) ERR_CONTEST_NOT_ENDED)
+    (map-set sponsorships
+      { sponsorship-id: sponsorship-id }
+      (merge sponsorship { is-active: false }))
+    (as-contract (stx-transfer? (get amount sponsorship) tx-sender (get sponsor sponsorship)))))
+
+(define-private (is-eligible-for-sponsorship (contest-id uint) (entry-id uint) (placement-requirement uint))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) false))
+        (winner-id (get winner-entry-id contest))
+        (runner-up-id (get runner-up-entry-id contest)))
+    (if (is-eq placement-requirement u1)
+      (is-eq (some entry-id) winner-id)
+      (if (is-eq placement-requirement u2)
+        (is-eq (some entry-id) runner-up-id)
+        (or (is-eq (some entry-id) winner-id)
+            (is-eq (some entry-id) runner-up-id))))))
+
+(define-read-only (get-sponsorship (sponsorship-id uint))
+  (map-get? sponsorships { sponsorship-id: sponsorship-id }))
+
+(define-read-only (get-sponsorship-claim (sponsorship-id uint))
+  (map-get? sponsorship-claims { sponsorship-id: sponsorship-id }))
+
+(define-read-only (get-contest-sponsorships-info (contest-id uint))
+  (map-get? contest-sponsorships { contest-id: contest-id }))
+
+(define-read-only (get-total-contest-prizes (contest-id uint))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) (err u404)))
+        (sponsorship-data (default-to
+                            { sponsorship-ids: (list), total-sponsored-amount: u0, active-sponsorships: u0 }
+                            (map-get? contest-sponsorships { contest-id: contest-id }))))
+    (ok {
+      base-prize-pool: (get prize-pool contest),
+      sponsored-amount: (get total-sponsored-amount sponsorship-data),
+      total-prize-pool: (+ (get prize-pool contest) (get total-sponsored-amount sponsorship-data)),
+      active-sponsorships: (get active-sponsorships sponsorship-data)
+    })))
+
+(define-read-only (get-unclaimed-sponsorships (contest-id uint))
+  (let ((sponsorship-data (map-get? contest-sponsorships { contest-id: contest-id })))
+    (match sponsorship-data
+      data (ok {
+              total-sponsorships: (len (get sponsorship-ids data)),
+              sponsorship-ids: (get sponsorship-ids data),
+              total-amount: (get total-sponsored-amount data)
+            })
+      (ok {
+            total-sponsorships: u0,
+            sponsorship-ids: (list),
+            total-amount: u0
+          }))))
+
+(define-read-only (can-claim-sponsorship (sponsorship-id uint) (participant principal))
+  (let ((sponsorship (map-get? sponsorships { sponsorship-id: sponsorship-id }))
+        (user-entry (if (is-some sponsorship)
+                      (map-get? user-entries { contest-id: (get contest-id (unwrap-panic sponsorship)), participant: participant })
+                      none)))
+    (if (and (is-some sponsorship) (is-some user-entry))
+      (let ((sponsor-data (unwrap-panic sponsorship))
+            (entry-data (unwrap-panic user-entry))
+            (contest (unwrap! (map-get? contests { contest-id: (get contest-id sponsor-data) }) (err u404))))
+        (ok {
+          is-active: (get is-active sponsor-data),
+          is-claimed: (get is-claimed sponsor-data),
+          is-finalized: (get is-finalized contest),
+          is-eligible: (is-eligible-for-sponsorship (get contest-id sponsor-data) (get entry-id entry-data) (get placement-requirement sponsor-data))
+        }))
+      (ok {
+            is-active: false,
+            is-claimed: false,
+            is-finalized: false,
+            is-eligible: false
+          }))))
+
+(define-read-only (get-sponsorship-summary (contest-id uint))
+  (let ((contest (unwrap! (map-get? contests { contest-id: contest-id }) (err u404)))
+        (sponsorship-data (default-to
+                            { sponsorship-ids: (list), total-sponsored-amount: u0, active-sponsorships: u0 }
+                            (map-get? contest-sponsorships { contest-id: contest-id }))))
+    (ok {
+      contest-id: contest-id,
+      base-pool: (get prize-pool contest),
+      sponsored-pool: (get total-sponsored-amount sponsorship-data),
+      combined-pool: (+ (get prize-pool contest) (get total-sponsored-amount sponsorship-data)),
+      sponsorship-count: (len (get sponsorship-ids sponsorship-data)),
+      active-count: (get active-sponsorships sponsorship-data),
+      is-contest-finalized: (get is-finalized contest)
     })))
